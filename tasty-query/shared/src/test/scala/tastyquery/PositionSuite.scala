@@ -309,6 +309,37 @@ class PositionSuite extends RestrictedUnpicklingSuite {
     assertEquals(collectCode[TypeApply](tree), List("Seq", "Seq[Int]", "A[Int, Seq[String]]"))
   }
 
+  testUnpickle("inferred-type-arg", "simple_trees.InferredTypeArgs") { tree =>
+    /*
+     * The inferred `Int` type argument in `id(42)` is encoded as a non-tree-tagged type (a `TYPEREF`). When tasty-query
+     * reads it, it must capture `span` before consuming the type bytes, otherwise the resulting `TypeWrapper` gets the
+     * position of whatever node comes next.
+     */
+    val idName = termName("id")
+    val typeApply = findTree(tree) {
+      case typeApply @ TypeApply(Select(_, SignedName(`idName`, _, _)), _) => typeApply
+      case typeApply @ TypeApply(Select(_, `idName`), _)                   => typeApply
+    }
+
+    val typeArg = typeApply.args match {
+      case (typeWrapper: TypeWrapper) :: Nil => typeWrapper
+      case other                             => fail(s"expected a single TypeWrapper, got: $other")
+    }
+
+    assertEquals(posToCode(typeArg.pos), Some("id"))
+  }
+
+  testUnpickle("package-ref-ident", "simple_trees.PackageRefIdent") { tree =>
+    /*
+     * The leading `scala` in `scala.Predef.identity(1)` is an `Ident` with a `TermRef` type pickled as TERMREFpkg. The
+     * unpickler must use the span captured before `readPackageRef` advances the reader, otherwise the `Ident` inherits
+     * the position of the next entry.
+     */
+    val scalaIdentifier = findTree(tree) { case identifier @ Ident(SimpleName("scala")) => identifier }
+
+    assertEquals(posToCode(scalaIdentifier.pos), Some("scala"))
+  }
+
   testUnpickle("type-ident", "simple_trees.Typed") { tree =>
     assertEquals(collectCode[TypeIdent](tree), List("Int"))
   }
@@ -369,12 +400,6 @@ class PositionSuite extends RestrictedUnpicklingSuite {
       collectCode[TypeDefinitionTree](tree),
       List(
         "Int",
-        /* The following makes no sense; it is the position of the type def
-         * of `type AbstractType`. It's probably dotc's auto-assigning of
-         * positions that goes wild.
-         */
-        """type AbstractType
-          |  type AbstractWithBounds >: Null <: Product""".stripMargin,
         ">: Null <: Product",
         "Int",
         "Null <: Product = Null",
@@ -388,7 +413,6 @@ class PositionSuite extends RestrictedUnpicklingSuite {
       collectCode[TypeDefinitionTree](tree),
       List(
         "[X] =>> List[X]",
-        "X] =>> List[X]", // TODO Improve this
         "List[X]"
       )
     )

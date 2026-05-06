@@ -1145,7 +1145,7 @@ private[tasties] class TreeUnpickler private (
       val simpleName = tpe match
         case tpe: PackageRef => tpe.fullyQualifiedName.simpleName
         case tpe: TermRef    => extractUnsignedName(tpe.name) // fallback for incomplete or invalid programs
-      Ident(simpleName)(tpe)(span)
+      Ident(simpleName)(tpe)(spn)
     case TERMREFdirect =>
       val spn = span
       reader.readByte()
@@ -1690,7 +1690,8 @@ private[tasties] class TreeUnpickler private (
     case tag if isTypeTreeTag(tag) =>
       throw TastyFormatException(s"Unexpected type tree tag ${astTagToString(tag)} $posErrorMsg")
     case _ =>
-      TypeWrapper(readNonEmptyPrefix())(span)
+      val spn = span
+      TypeWrapper(readNonEmptyPrefix())(spn)
   }
 
   private def readInlinedCaller(end: Addr)(using SourceFile): Option[TypeIdent | SelectTypeTree] =
