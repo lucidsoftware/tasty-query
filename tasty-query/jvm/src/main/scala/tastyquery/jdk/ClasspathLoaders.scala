@@ -18,8 +18,12 @@ object ClasspathLoaders {
     case Class extends FileKind("class")
     case Tasty extends FileKind("tasty")
 
-    def appliesTo(path: Path): Boolean =
-      path.getFileName().nn.toString().endsWith("." + ext)
+    private val suffix = "." + ext
+
+    def appliesTo(path: Path): Boolean = appliesTo(path.getFileName.nn.toString)
+    def appliesTo(filename: String): Boolean = filename.endsWith(suffix)
+    def removeExtension(fileName: String): String =
+      fileName.substring(0, fileName.length() - suffix.length())
   end FileKind
 
   private object FileKind:
@@ -91,7 +95,7 @@ object ClasspathLoaders {
 
     def toEntry(entryDebugString: String, entry: ClasspathEntryKind): representation.ClasspathEntry =
       val map = entry.walkFiles(kinds.toSeq*) { (kind, fileWithExt, path, classpathFile) =>
-        val (s"$file.${kind.`ext`}") = fileWithExt: @unchecked
+        val file = kind.removeExtension(fileWithExt)
         val bin = binaryName(file)
         val (packageName, simpleName) = classAndPackage(bin)
         kind match {
@@ -141,23 +145,15 @@ object ClasspathLoaders {
     def walkFiles[T](kinds: FileKind*)(op: (FileKind, String, String, OpenClasspathFile) => T): Map[FileKind, List[T]] =
       this match {
         case Jar(path) =>
-          val exts0 = kinds.map(kind => s".${kind.ext}")
           def getFullPath(filename: String): String = s"$path:$filename"
           val matching = mutable.HashMap.from(kinds.map(kind => kind -> mutable.ListBuffer.empty[JarEntry]))
           Using(JarFile(path.toFile())) { jar =>
             val results = {
               import scala.language.unsafeNulls
-              def matches(je: JarEntry): Boolean = {
-                val name = je.getName
-                exts0.exists(name.endsWith)
-              }
               val stream = jar.stream
               stream.forEach { je =>
-                if matches(je) then
-                  matching(kinds.find { kind =>
-                    val name = je.getName
-                    name.endsWith(kind.ext)
-                  }.get) += je
+                val entryName = je.getName
+                kinds.find(_.appliesTo(entryName)).foreach(matching(_) += je)
               }
               matching.map { case kind -> jes =>
                 kind ->
