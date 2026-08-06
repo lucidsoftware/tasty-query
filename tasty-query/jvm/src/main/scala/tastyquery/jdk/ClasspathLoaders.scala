@@ -1,13 +1,11 @@
 package tastyquery.jdk
 
-import java.io.{InputStream, IOException}
+import java.io.{IOException, InputStream}
 import java.nio.file.*
 import java.nio.file.attribute.BasicFileAttributes
 import java.util.jar.{JarEntry, JarFile}
-
 import scala.collection.mutable
 import scala.util.Using
-
 import tastyquery.Classpaths.*
 
 /** Classpath loaders using the JDK API.
@@ -33,8 +31,9 @@ object ClasspathLoaders {
     * Entries can be directories or jar files. Non-existing entries are
     * ignored.
     *
-    * This method will synchronously read the contents of all `.class` and
-    * `.tasty` files on the classpath.
+    * This method will synchronously read the contents of all `.class` and `.tasty` files on the classpath. However, if
+    * [[lazyLoading]] is set to `true`, these files won't be read until they're needed. Indexing will still be performed
+    * eagerly so we know _which_ `.class` and `.tasty` files to read.
     *
     * The resulting [[Classpaths.Classpath]] can be given to [[Contexts.Context.initialize]]
     * to create a [[Contexts.Context]]. The latter gives semantic access to all
@@ -43,13 +42,21 @@ object ClasspathLoaders {
     * The entries of the resulting [[Classpaths.Classpath]] are all guaranteed
     * to be thread-safe.
     *
+    * @param classpath The list of classpath entries to read.
+    * @param lazyLoading If set to `true`, the `.class and `.tasty` files won't be read until they're needed.
+    *
     * @note the resulting [[Classpaths.ClasspathEntry ClasspathEntry]] entries of
     *       the returned [[Classpaths.Classpath]] correspond to the elements of `classpath`.
     */
-  def read(classpath: List[Path]): Classpath =
-    read(classpath, FileKind.All)
+  def read(classpath: List[Path], lazyLoading: Boolean): Classpath =
+    read(if (lazyLoading) OnDisk else InMemory)(classpath, FileKind.All, lazyLoading)
 
-  private def read(classpath: List[Path], kinds: Set[FileKind]): Classpath =
+  def read(classpath: List[Path]): Classpath = read(classpath, lazyLoading = false)
+
+  private def read(
+    representation: ClasspathRepresentation
+  )(classpath: List[Path], kinds: Set[FileKind], lazyLoading: Boolean): Classpath =
+    val representation = if (lazyLoading) OnDisk else InMemory
 
     def classAndPackage(binaryName: String): (String, String) = {
       val lastSep = binaryName.lastIndexOf('.')
@@ -71,35 +78,34 @@ object ClasspathLoaders {
 
     def compressPackageData(
       entryDebugString: String,
-      data: List[(String, InMemory.ClassData)]
-    ): List[InMemory.PackageData] =
+      data: List[(String, representation.ClassData)]
+    ): List[representation.PackageData] =
       val groupedPackages = data.groupMap((pkg, _) => pkg)((_, data) => data)
       groupedPackages.map { (packageName, allClassDatas) =>
         val packageDebugString = entryDebugString + ":" + packageName
         val mergedClassDatas =
-          allClassDatas.groupMapReduce(_.binaryName)(identity)(_.combineWith(_)).valuesIterator.toList
-        InMemory.PackageData(packageDebugString, packageName, mergedClassDatas)
+          allClassDatas.groupMapReduce(_.binaryName)(identity)(representation.combineClassData).valuesIterator.toList
+        representation.packageData(packageDebugString, packageName, mergedClassDatas)
       }.toList
     end compressPackageData
 
-    def toEntry(entryDebugString: String, entry: ClasspathEntryKind): InMemory.ClasspathEntry =
-      val map = entry.walkFiles(kinds.toSeq*) { (kind, fileWithExt, path, bytes) =>
+    def toEntry(entryDebugString: String, entry: ClasspathEntryKind): representation.ClasspathEntry =
+      val map = entry.walkFiles(kinds.toSeq*) { (kind, fileWithExt, path, classpathFile) =>
         val (s"$file.${kind.`ext`}") = fileWithExt: @unchecked
         val bin = binaryName(file)
         val (packageName, simpleName) = classAndPackage(bin)
         kind match {
           case FileKind.Class =>
-            packageName -> InMemory.ClassData(path, simpleName, None, Some(bytes))
+            packageName -> representation.classData(path, simpleName, None, Some(classpathFile))
           case FileKind.Tasty =>
-            packageName -> InMemory.ClassData(path, simpleName, Some(bytes), None)
+            packageName -> representation.classData(path, simpleName, Some(classpathFile), None)
         }
       }
-      val packageDatas: List[InMemory.PackageData] =
-        compressPackageData(
-          entryDebugString,
-          map.get(FileKind.Class).getOrElse(Nil) ++ map.get(FileKind.Tasty).getOrElse(Nil)
-        )
-      InMemory.ClasspathEntry(entryDebugString, packageDatas)
+      val packageDatas = compressPackageData(
+        entryDebugString,
+        map.get(FileKind.Class).getOrElse(Nil) ++ map.get(FileKind.Tasty).getOrElse(Nil)
+      )
+      representation.classpathEntry(entryDebugString, packageDatas)
     end toEntry
 
     classpathToEntries(classpath).map(toEntry)
@@ -132,7 +138,7 @@ object ClasspathLoaders {
     case Directory(path: Path)
     case Empty
 
-    def walkFiles[T](kinds: FileKind*)(op: (FileKind, String, String, IArray[Byte]) => T): Map[FileKind, List[T]] =
+    def walkFiles[T](kinds: FileKind*)(op: (FileKind, String, String, OpenClasspathFile) => T): Map[FileKind, List[T]] =
       this match {
         case Jar(path) =>
           val exts0 = kinds.map(kind => s".${kind.ext}")
@@ -156,9 +162,24 @@ object ClasspathLoaders {
               matching.map { case kind -> jes =>
                 kind ->
                   jes.toList.map { je =>
-                    Using(jar.getInputStream(je))(is =>
-                      op(kind, je.getName(), getFullPath(je.getName()), loadBytes(is))
-                    ).get
+                    val entryName = je.getName
+                    val _classpathFile = new ClasspathFile {
+                      override def read(): IArray[Byte] =
+                        Using(JarFile(path.toFile)) { jar =>
+                          val je = Option(jar.getJarEntry(entryName)).getOrElse(
+                            throw new Exception(s"`$entryName` no longer exists in `$path`.")
+                          )
+
+                          Using(jar.getInputStream(je))(loadBytes).get
+                        }.get
+                    }
+
+                    val openClasspathFile = new OpenClasspathFile {
+                      override def classpathFile: ClasspathFile = _classpathFile
+                      override def readNow(): IArray[Byte] = Using(jar.getInputStream(je))(loadBytes).get
+                    }
+
+                    op(kind, je.getName(), getFullPath(je.getName()), openClasspathFile)
                   }
               }.toMap
             }
@@ -191,8 +212,16 @@ object ClasspathLoaders {
           matching.map { case ext -> files =>
             ext ->
               files.toList.map { f =>
-                val bytes = IArray.from(Files.readAllBytes(f))
-                op(ext, path.relativize(f).toString(), f.toString(), bytes)
+                val _classpathFile = new ClasspathFile {
+                  override def read(): IArray[Byte] = IArray.from(Files.readAllBytes(f))
+                }
+
+                val openClasspathFile = new OpenClasspathFile {
+                  override def classpathFile: ClasspathFile = _classpathFile
+                  override def readNow(): IArray[Byte] = IArray.from(Files.readAllBytes(f))
+                }
+
+                op(ext, path.relativize(f).toString(), f.toString(), openClasspathFile)
               }
           }.toMap
 

@@ -127,6 +127,24 @@ lazy val tastyQuery =
       mimaBinaryIssueFilters ++= {
         import com.typesafe.tools.mima.core.*
         Seq(
+          ProblemFilters.exclude[MissingFieldProblem]("tastyquery.Classpaths.OnDisk"),
+          ProblemFilters.exclude[MissingClassProblem]("tastyquery.Classpaths$ClasspathFile"),
+          ProblemFilters.exclude[MissingClassProblem]("tastyquery.Classpaths$ClasspathRepresentation"),
+          ProblemFilters.exclude[MissingTypesProblem]("tastyquery.Classpaths$InMemory$"),
+          ProblemFilters.exclude[DirectMissingMethodProblem]("tastyquery.Classpaths#InMemory.classData"),
+          ProblemFilters.exclude[DirectMissingMethodProblem]("tastyquery.Classpaths#InMemory.classpathEntry"),
+          ProblemFilters.exclude[DirectMissingMethodProblem]("tastyquery.Classpaths#InMemory.combineClassData"),
+          ProblemFilters.exclude[DirectMissingMethodProblem]("tastyquery.Classpaths#InMemory.packageData"),
+          ProblemFilters.exclude[DirectMissingMethodProblem]("tastyquery.Classpaths#InMemory#ClassData.debugString"),
+          ProblemFilters.exclude[MissingClassProblem]("tastyquery.Classpaths$OnDisk$"),
+          ProblemFilters.exclude[MissingClassProblem]("tastyquery.Classpaths$OnDisk$ClassData"),
+          ProblemFilters.exclude[MissingClassProblem]("tastyquery.Classpaths$OnDisk$ClasspathEntry"),
+          ProblemFilters.exclude[MissingClassProblem]("tastyquery.Classpaths$OnDisk$PackageData"),
+          ProblemFilters.exclude[MissingClassProblem]("tastyquery.Classpaths$OpenClasspathFile"),
+          ProblemFilters.exclude[DirectMissingMethodProblem]("tastyquery.jdk.ClasspathLoaders.read"),
+          ProblemFilters.exclude[IncompatibleSignatureProblem](
+            "tastyquery.jdk.ClasspathLoaders#ClasspathEntryKind.walkFiles"
+          ),
         )
       },
 
