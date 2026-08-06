@@ -104,11 +104,61 @@ object Classpaths:
     def readClassFileBytes(): IArray[Byte]
   end ClassData
 
+  /** An abstraction over an individual file on the classpath (virtual file).
+    *
+    * This augments [[ClasspathFile]] with a [[readNow]] method that can be used during the initial indexing of
+    * the classpath to reuse open file descriptors.
+    *
+    * This trait doesn't extend [[ClasspathFile]] because we don't want [[ClasspathFile]]s read later to hold onto
+    * references to open files.
+    */
+  private[tastyquery] trait OpenClasspathFile:
+    def classpathFile: ClasspathFile
+
+    /** Read the contents of the file during the initial indexing of the classpath.
+      *
+      * This should be preferred over [[ClasspathFile.read]] during indexing, as it reuses open file descriptors. If
+      * called later, an exception will be thrown.
+      */
+    def readNow(): IArray[Byte]
+  end OpenClasspathFile
+
+  /** An abstraction over an individual file on the classpath (virtual file). */
+  private[tastyquery] trait ClasspathFile:
+    /** Read the contents of the file.
+      *
+      * Implementations of this method should always open the file and not reference any open file descriptors, as this
+      * may be called after the initial indexing of the classpath.
+      */
+    def read(): IArray[Byte]
+  end ClasspathFile
+
+  /** An abstraction over a representation of the classpath.
+    *
+    * Currently, [[InMemory]] and [[OnDisk]] are the only implementations.
+    */
+  private[tastyquery] trait ClasspathRepresentation:
+    type ClasspathEntry <: Classpaths.ClasspathEntry
+    type PackageData <: Classpaths.PackageData
+    type ClassData <: Classpaths.ClassData
+
+    def classData(
+      debugString: String,
+      binaryName: String,
+      tastyFile: Option[OpenClasspathFile],
+      classFile: Option[OpenClasspathFile]
+    ): ClassData
+
+    def classpathEntry(debugString: String, packages: List[PackageData]): ClasspathEntry
+    def combineClassData(classData1: ClassData, classData2: ClassData): ClassData
+    def packageData(debugString: String, dotSeparatedName: String, classes: List[ClassData]): PackageData
+  end ClasspathRepresentation
+
   /** In-memory representation of classpath entries.
     *
     * In-memory classpath entries are thread-safe.
     */
-  object InMemory:
+  object InMemory extends ClasspathRepresentation:
     import Classpaths as generic
 
     /** A thread-safe, immutable classpath entry. */
@@ -121,7 +171,7 @@ object Classpaths:
     /** A thread-safe, immutable package information within a classpath entry. */
     final class PackageData(debugString: String, val dotSeparatedName: String, val classes: List[ClassData])
         extends generic.PackageData:
-      private lazy val byBinaryName = classes.map(c => c.binaryName -> c).toMap
+      private lazy val byBinaryName = classes.view.map(c => c.binaryName -> c).toMap
 
       override def toString(): String = debugString
 
@@ -132,7 +182,7 @@ object Classpaths:
 
     /** A thread-safe, immutable class information within a classpath entry. */
     final class ClassData(
-      debugString: String,
+      private[InMemory] val debugString: String,
       val binaryName: String,
       val tastyFileBytes: Option[IArray[Byte]],
       val classFileBytes: Option[IArray[Byte]]
@@ -141,24 +191,113 @@ object Classpaths:
 
       def hasTastyFile: Boolean = tastyFileBytes.isDefined
 
-      def readTastyFileBytes(): IArray[Byte] = tastyFileBytes.get
+      def readTastyFileBytes(): IArray[Byte] =
+        tastyFileBytes.getOrElse(throw new Exception(s"${this} has no TASTy file."))
 
       def hasClassFile: Boolean = classFileBytes.isDefined
 
-      def readClassFileBytes(): IArray[Byte] = classFileBytes.get
+      def readClassFileBytes(): IArray[Byte] =
+        classFileBytes.getOrElse(throw new Exception(s"${this} has no class file."))
 
-      def combineWith(that: ClassData): ClassData =
-        require(
-          this.binaryName == that.binaryName,
-          s"cannot combine two ClassData for different binary names ${this.binaryName} and ${that.binaryName}"
-        )
-        ClassData(
-          debugString,
-          binaryName,
-          this.tastyFileBytes.orElse(that.tastyFileBytes),
-          this.classFileBytes.orElse(that.classFileBytes)
-        )
-      end combineWith
+      def combineWith(that: ClassData): ClassData = InMemory.combineClassData(this, that)
     end ClassData
+
+    override def classData(
+      debugString: String,
+      binaryName: String,
+      tastyFile: Option[OpenClasspathFile],
+      classFile: Option[OpenClasspathFile]
+    ): ClassData = new ClassData(debugString, binaryName, tastyFile.map(_.readNow()), classFile.map(_.readNow()))
+
+    override def classpathEntry(debugString: String, packages: List[PackageData]): ClasspathEntry =
+      new ClasspathEntry(debugString, packages)
+
+    override def combineClassData(classData1: ClassData, classData2: ClassData): ClassData =
+      require(
+        classData1.binaryName == classData2.binaryName,
+        s"cannot combine two ClassData for different binary names ${classData1.binaryName} and ${classData2.binaryName}"
+      )
+
+      ClassData(
+        classData1.debugString,
+        classData1.binaryName,
+        classData1.tastyFileBytes.orElse(classData2.tastyFileBytes),
+        classData1.classFileBytes.orElse(classData2.classFileBytes)
+      )
+
+    override def packageData(debugString: String, dotSeparatedName: String, classes: List[ClassData]): PackageData =
+      new PackageData(debugString, dotSeparatedName, classes)
   end InMemory
+
+  /** Lazily loaded, on-disk representation of classpath entries.
+    *
+    * Unlike [[InMemory]], [[OnDisk]] loads `.tasty` and `.class` files lazily, when they're needed. This may be desired
+    * when eagerly loading every file on the classpath would take too much time or memory.
+    *
+    * [[OnDisk]] doesn't cache file content, so repeated calls to [[ClassData.readTastyFileBytes]] or
+    * [[ClassData.readClassFileBytes]] will read the file from disk each time. This shouldn't be a problem in practice,
+    * as [[Contexts.Context]] caches the deserialized representation of these files. Note that this means the files need
+    * to be readable for the lifetime of the [[Contexts.Context]] that uses them.
+    */
+  object OnDisk extends ClasspathRepresentation:
+    import Classpaths as generic
+
+    final class ClasspathEntry(debugString: String, val packages: List[PackageData]) extends generic.ClasspathEntry:
+      override def listAllPackages(): List[generic.PackageData] = packages
+      override def toString: String = debugString
+    end ClasspathEntry
+
+    final class PackageData(debugString: String, val dotSeparatedName: String, val classes: List[ClassData])
+        extends generic.PackageData:
+      private lazy val byBinaryName = classes.view.map(`class` => `class`.binaryName -> `class`).toMap
+
+      override def getClassDataByBinaryName(binaryName: String): Option[ClassData] = byBinaryName.get(binaryName)
+      override def listAllClassDatas(): List[ClassData] = classes
+      override def toString: String = debugString
+    end PackageData
+
+    final class ClassData(
+      private[OnDisk] val debugString: String,
+      val binaryName: String,
+      val tastyFile: Option[ClasspathFile],
+      val classFile: Option[ClasspathFile]
+    ) extends generic.ClassData:
+      override def hasTastyFile: Boolean = tastyFile.isDefined
+      override def readTastyFileBytes(): IArray[Byte] =
+        tastyFile.getOrElse(throw new Exception(s"${this} has no TASTy file.")).read()
+
+      override def hasClassFile: Boolean = classFile.isDefined
+      override def readClassFileBytes(): IArray[Byte] =
+        classFile.getOrElse(throw new Exception(s"${this} has no class file.")).read()
+
+      override def toString: String = debugString
+    end ClassData
+
+    override def classData(
+      debugString: String,
+      binaryName: String,
+      tastyFile: Option[OpenClasspathFile],
+      classFile: Option[OpenClasspathFile]
+    ): ClassData =
+      new ClassData(debugString, binaryName, tastyFile.map(_.classpathFile), classFile.map(_.classpathFile))
+
+    override def classpathEntry(debugString: String, packages: List[PackageData]): ClasspathEntry =
+      new ClasspathEntry(debugString, packages)
+
+    override def combineClassData(classData1: ClassData, classData2: ClassData): ClassData =
+      require(
+        classData1.binaryName == classData2.binaryName,
+        s"cannot combine two ClassData for different binary names ${classData1.binaryName} and ${classData2.binaryName}"
+      )
+
+      ClassData(
+        classData1.debugString,
+        classData1.binaryName,
+        classData1.tastyFile.orElse(classData2.tastyFile),
+        classData1.classFile.orElse(classData2.classFile)
+      )
+
+    override def packageData(debugString: String, dotSeparatedName: String, classes: List[ClassData]): PackageData =
+      new PackageData(debugString, dotSeparatedName, classes)
+  end OnDisk
 end Classpaths
